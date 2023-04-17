@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+data:
+  trigger.on-sync-status-unknown: |
+    - when: app.status.sync.status == 'Unknown'     # trigger condition
+      send: [app-sync-status, github-commit-status] # template names
+  trigger.sync-operation-change: |
+    - when: app.status.operationState.phase in ['Error', 'Failed'] # `in` も使える
+      send: [app-sync-failed, github-commit-status]
+  # Optional 'oncePer' property ensure that notification is sent only once per specified field value
+  # E.g. following is triggered once per sync revision
+  trigger.on-deployed: |
+    when: app.status.operationState.phase in ['Succeeded'] and app.status.health.status == 'Healthy'
+    oncePer: app.status.sync.revision
+    send: [app-sync-succeeded, app-event-to-webhook]
+  # Add the Lua script to get the secret and generate the HMAC-SHA1 signature
+  script.get_signature: |
+    local secretmanager = require("google.cloud.secretmanager")
+    local crypto = require("crypto")
+    local json = require("json")
+    function getSignature(uid, app)
+      local projectName = os.getenv("PROJECT_NAME")
+      # local projectName = "{{ index .secrets.eventHandlerSecrets.data \"projectName\" }}"
+      local secretName = "custom-ev-handler"
+      local versionNum = "latest"
+      local secret = secretmanager.getSecret(projectName, secretName, versionNum)
+      local hmac = crypto.hmac.new(secret, crypto.hash.sha1)
+      hmac:update(json.encode(app))
+      return hmac:digest()
+    end
+
+
+  # カスタム通知プロバイダの定義
+  service.custom-webhook: |
+    url: "{{ env 'WEBHOOK' }}"
+    headers:
+      Content-Type: application/json
+      Argpcd-Signature: "{{ lua_call 'get_signature' .app.metadata.uid .app }}"
+
+  # 通知テンプレートの定義
+  template.app-event-to-webhook: |
+    webhook:
+      argocd-webhook: |
+      {
+        "message": {
+          "attributes": {
+            "event_type": "deployment",
+            "id": "{{.app.metadata.uid}}",
+            "app_name": "{{.app.metadata.name}}",
+            "sync_status": "{{.app.status.sync.status}}",
+            "health_status": "{{.app.status.health.status}}"
+          },
+          "data": "{{ .app.metadata | toJson | b64enc }}",
+          "message_id": "{{ .app.metadata.uid }}",
+          "publish_time": "{{ now }}"
+        },
+        "signature": "{{ lua_call 'get_signature' .app.metadata.uid .app }}"
+      }}
